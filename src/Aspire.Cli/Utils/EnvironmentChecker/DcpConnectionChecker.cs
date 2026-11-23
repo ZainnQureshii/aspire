@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Diagnostics;
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Net.Security;
@@ -28,7 +29,9 @@ internal sealed class DcpConnectionChecker(
     ILogger<DcpConnectionChecker> logger) : IDcpConnectionChecker
 {
     private static readonly TimeSpan s_connectionTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan s_stopRequestTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan s_processExitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan s_processExitPollInterval = TimeSpan.FromMilliseconds(50);
 
     public async Task<EnvironmentCheckResult> TestConnectionAsync(string dcpDirectory, bool useDeveloperCertificate, CancellationToken cancellationToken)
     {
@@ -47,7 +50,7 @@ internal sealed class DcpConnectionChecker(
                 logger,
                 timeoutCts.Token).ConfigureAwait(false);
 
-            using var kubeconfig = await session.ReadKubeconfigAsync(timeoutCts.Token).ConfigureAwait(false);
+            var kubeconfig = await session.ReadKubeconfigAsync(timeoutCts.Token).ConfigureAwait(false);
             using var handler = CreateHttpClientHandler(kubeconfig);
             using var client = new HttpClient(handler)
             {
@@ -71,8 +74,6 @@ internal sealed class DcpConnectionChecker(
                         (int)response.StatusCode,
                         response.StatusCode));
             }
-
-            await session.StopDcpAsync(client, kubeconfig, timeoutCts.Token).ConfigureAwait(false);
 
             return useDeveloperCertificate
                 ? Passed(useDeveloperCertificate, DoctorCommandStrings.DcpDeveloperCertificateConnectionSucceededMessage)
@@ -204,7 +205,7 @@ internal sealed class DcpConnectionChecker(
         private readonly string _kubeconfigPath;
         private readonly OutputCollector _output;
         private readonly ILogger _logger;
-        private bool _stopRequested;
+        private DcpKubeconfig? _kubeconfig;
 
         private DcpConnectionTestSession(IProcessExecution process, string sessionDirectory, string kubeconfigPath, OutputCollector output, ILogger logger)
         {
@@ -287,31 +288,18 @@ internal sealed class DcpConnectionChecker(
             }
             catch
             {
-                if (process is not null)
+                if (processStarted && !process!.HasExited)
                 {
-                    try
-                    {
-                        if (processStarted && !process.HasExited)
-                        {
-                            process.Kill(entireProcessTree: true);
-                        }
-                    }
-                    catch (InvalidOperationException) when (process.HasExited)
-                    {
-                    }
-                    finally
+                    await new DcpConnectionTestSession(process, sessionDirectory, kubeconfigPath, output, logger).DisposeAsync().ConfigureAwait(false);
+                }
+                else
+                {
+                    if (process is not null)
                     {
                         await process.DisposeAsync().ConfigureAwait(false);
                     }
-                }
 
-                try
-                {
-                    Directory.Delete(sessionDirectory, recursive: true);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogDebug(ex, "Failed to delete DCP doctor session directory '{SessionDirectory}'.", sessionDirectory);
+                    TryDeleteSessionDirectory(sessionDirectory, logger);
                 }
 
                 throw;
@@ -320,48 +308,40 @@ internal sealed class DcpConnectionChecker(
 
         public async Task<DcpKubeconfig> ReadKubeconfigAsync(CancellationToken cancellationToken)
         {
+            if (_kubeconfig is not null)
+            {
+                return _kubeconfig;
+            }
+
             await WaitForKubeconfigFileAsync(cancellationToken).ConfigureAwait(false);
 
-            return await DcpKubeconfig.ReadFileWithRetryAsync(_kubeconfigPath, cancellationToken: cancellationToken).ConfigureAwait(false);
-        }
-
-        public async Task StopDcpAsync(HttpClient client, DcpKubeconfig kubeconfig, CancellationToken cancellationToken)
-        {
-            if (_stopRequested)
-            {
-                return;
-            }
-
-            _stopRequested = true;
-
-            try
-            {
-                using var request = new HttpRequestMessage(HttpMethod.Patch, new Uri(kubeconfig.Server, "/admin/execution"))
-                {
-                    Content = new StringContent("""{"status":"Stopping","shutdownResourceCleanup":"None"}""", Encoding.UTF8, "application/merge-patch+json")
-                };
-
-                using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
-                if (!response.IsSuccessStatusCode)
-                {
-                    _logger.LogDebug("DCP doctor stop request returned HTTP {StatusCode}.", response.StatusCode);
-                }
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogDebug(ex, "Failed to request DCP shutdown for doctor connection check.");
-            }
+            _kubeconfig = await DcpKubeconfig.ReadFileWithRetryAsync(_kubeconfigPath, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return _kubeconfig;
         }
 
         public async ValueTask DisposeAsync()
         {
             try
             {
-                if (!_process.HasExited)
+                var exited = _process.HasExited;
+                if (!exited && await RequestStopAsync().ConfigureAwait(false))
                 {
-                    _process.Kill(entireProcessTree: true);
-                    using var exitCts = new CancellationTokenSource(s_processExitTimeout);
-                    await _process.WaitForExitAsync(exitCts.Token).ConfigureAwait(false);
+                    exited = await WaitForExitAsync().ConfigureAwait(false);
+                }
+
+                if (exited)
+                {
+                    await _process.DisposeAsync().ConfigureAwait(false);
+                    TryDeleteSessionDirectory(_sessionDirectory, _logger);
+                }
+                else
+                {
+                    // Disposing a running process would kill it.
+                    // Abandon the handle instead; the use of --monitor flag will cause DCP process initiate shutdown sequence when this process exits.
+                    // DCP removes its own session folder when it shuts down, so the session directory is left in place while it runs.
+                    _logger.LogDebug(
+                        "DCP doctor process {ProcessId} did not stop gracefully; leaving it to exit with its monitored parent.",
+                        _process.ProcessId);
                 }
             }
             catch (Exception ex)
@@ -370,16 +350,91 @@ internal sealed class DcpConnectionChecker(
             }
             finally
             {
-                await _process.DisposeAsync().ConfigureAwait(false);
+                _kubeconfig?.Dispose();
+            }
+        }
 
-                try
+        /// <returns><see langword="true"/> if DCP accepted the stop request.</returns>
+        private async Task<bool> RequestStopAsync()
+        {
+            // Teardown must not depend on the caller's (possibly already cancelled) probe token.
+            using var timeoutCts = new CancellationTokenSource(s_stopRequestTimeout);
+
+            try
+            {
+                if (_kubeconfig is null && !File.Exists(_kubeconfigPath))
                 {
-                    Directory.Delete(_sessionDirectory, recursive: true);
+                    _logger.LogDebug("DCP doctor kubeconfig '{KubeconfigPath}' does not exist; cannot request DCP shutdown.", _kubeconfigPath);
+                    return false;
                 }
-                catch (Exception ex)
+
+                var kubeconfig = await ReadKubeconfigAsync(timeoutCts.Token).ConfigureAwait(false);
+                using var handler = CreateHttpClientHandler(kubeconfig);
+                using var client = new HttpClient(handler)
                 {
-                    _logger.LogDebug(ex, "Failed to delete DCP doctor session directory '{SessionDirectory}'.", _sessionDirectory);
+                    BaseAddress = kubeconfig.Server,
+                    Timeout = s_stopRequestTimeout
+                };
+
+                if (!string.IsNullOrWhiteSpace(kubeconfig.Token))
+                {
+                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", kubeconfig.Token);
                 }
+
+                // The doctor DCP instance never creates workloads, so it can skip resource cleanup.
+                var content = new StringContent("""{"status":"Stopping","shutdownResourceCleanup":"None"}""", Encoding.UTF8);
+                content.Headers.ContentType = new MediaTypeHeaderValue("application/merge-patch+json");
+                using var request = new HttpRequestMessage(HttpMethod.Patch, new Uri(kubeconfig.Server, "/admin/execution"))
+                {
+                    Content = content
+                };
+
+                using var response = await client.SendAsync(request, timeoutCts.Token).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogDebug("DCP doctor stop request returned HTTP {StatusCode}.", response.StatusCode);
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to request DCP shutdown for doctor connection check.");
+                return false;
+            }
+        }
+
+        private async Task<bool> WaitForExitAsync()
+        {
+            // Poll instead of calling IProcessExecution.WaitForExitAsync with a timeout token:
+            // a cancelled wait terminates the child, which is exactly what this teardown needs to avoid.
+            var stopwatch = Stopwatch.StartNew();
+            while (!_process.HasExited)
+            {
+                if (stopwatch.Elapsed >= s_processExitTimeout)
+                {
+                    return false;
+                }
+
+                await Task.Delay(s_processExitPollInterval).ConfigureAwait(false);
+            }
+
+            return true;
+        }
+
+        private static void TryDeleteSessionDirectory(string sessionDirectory, ILogger logger)
+        {
+            try
+            {
+                Directory.Delete(sessionDirectory, recursive: true);
+            }
+            catch (DirectoryNotFoundException)
+            {
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "Failed to delete DCP doctor session directory '{SessionDirectory}'.", sessionDirectory);
             }
         }
 
